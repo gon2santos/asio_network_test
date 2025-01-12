@@ -4,6 +4,9 @@
 
 #include <functional>
 
+asio::io_context io_context;
+asio::steady_timer timer(io_context, std::chrono::seconds(1));
+
 enum class CustomMsgTypes : uint32_t
 {
     ServerAccept,
@@ -36,18 +39,61 @@ public:
     }
 };
 
+CustomClient c;
+
+void check_connection()
+{
+    if (c.IsConnected())
+    {
+        if (!c.Incoming().empty())
+        {
+            auto msg = c.Incoming().pop_front().msg;
+
+            switch (msg.header.id)
+            {
+            case CustomMsgTypes::ServerAccept:
+            {
+                std::cout << "Server Accepted Connection\n";
+            }
+            break;
+
+            case CustomMsgTypes::ServerPing:
+            {
+                std::chrono::system_clock::time_point timeNow = std::chrono::system_clock::now();
+                std::chrono::system_clock::time_point timeThen;
+                msg >> timeThen;
+                std::cout << "Ping: " << std::chrono::duration<double>(timeNow - timeThen).count() << "\n";
+            }
+            break;
+
+            case CustomMsgTypes::ServerMessage:
+            {
+                uint32_t clientID;
+                msg >> clientID;
+                std::cout << "Hello from [" << clientID << "]\n";
+            }
+            break;
+            }
+        }
+    }
+    else
+    {
+        std::cout << "Server Down\n";
+    }
+
+    // Reset the timer and call check_connection again after 1 second
+    timer.expires_after(std::chrono::seconds(1));
+    timer.async_wait([](const asio::error_code & /*e*/)
+                     { check_connection(); });
+}
+
 int main()
 {
-
-    asio::io_service ioservice;
-    asio::posix::stream_descriptor stream(ioservice, STDIN_FILENO);
+    asio::posix::stream_descriptor stream(io_context, STDIN_FILENO);
 
     char buf[1] = {};
 
-    CustomClient c;
     c.Connect("127.0.0.1", 60000);
-
-    bool bQuit = false;
 
     std::function<void(asio::error_code, size_t)> read_handler;
 
@@ -74,7 +120,7 @@ int main()
                 else if (buf[0] == '2')
                 {
                     std::cout << "Stopping" << std::endl;
-                    ioservice.stop();
+                    io_context.stop();
                     return;
                 }
             }
@@ -82,50 +128,9 @@ int main()
         }
     };
 
-    if (c.IsConnected())
-    {
-        if (!c.Incoming().empty())
-        {
-
-            auto msg = c.Incoming().pop_front().msg;
-
-            switch (msg.header.id)
-            {
-            case CustomMsgTypes::ServerAccept:
-            {
-                // Server has responded to a ping request
-                std::cout << "Server Accepted Connection\n";
-            }
-            break;
-
-            case CustomMsgTypes::ServerPing:
-            {
-                // Server has responded to a ping request
-                std::chrono::system_clock::time_point timeNow = std::chrono::system_clock::now();
-                std::chrono::system_clock::time_point timeThen;
-                msg >> timeThen;
-                std::cout << "Ping: " << std::chrono::duration<double>(timeNow - timeThen).count() << "\n";
-            }
-            break;
-
-            case CustomMsgTypes::ServerMessage:
-            {
-                // Server has responded to a ping request
-                uint32_t clientID;
-                msg >> clientID;
-                std::cout << "Hello from [" << clientID << "]\n";
-            }
-            break;
-            }
-        }
-    }
-    else
-    {
-        std::cout << "Server Down\n";
-        bQuit = true;
-    }
-
     asio::async_read(stream, asio::buffer(buf), read_handler);
 
-    ioservice.run();
+    check_connection();
+
+    io_context.run();
 }
