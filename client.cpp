@@ -78,7 +78,9 @@ void check_connection()
     }
     else
     {
-        std::cout << "Server Down\n";
+        std::cout << "Server Down, shutting down...\n";
+        io_context.stop();
+        return;
     }
 
     // Reset the timer and call check_connection again after 1 second
@@ -124,10 +126,15 @@ int main()
                     return;
                 }
             }
-            asio::async_read(stream, asio::buffer(buf), read_handler);
+            // Introduce a small delay before reading again
+            timer.expires_after(std::chrono::milliseconds(50));
+            timer.async_wait([&](const asio::error_code & /*e*/)
+                             { asio::async_read(stream, asio::buffer(buf), read_handler); });
         }
     };
-
+    // Start the periodic check with a delay
+    timer.async_wait([](const asio::error_code & /*e*/)
+                     { check_connection(); });
     asio::async_read(stream, asio::buffer(buf), read_handler);
 
     check_connection();
