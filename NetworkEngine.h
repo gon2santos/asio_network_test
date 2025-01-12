@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include <pthread.h>
 #include <deque>
 #include <optional>
 #include <vector>
@@ -20,6 +19,10 @@
 
 namespace Net
 {
+    // Message
+
+    // Message Header is sent at start of all messages. The template allows us
+    // to use "enum class" to ensure that the messages are valid at compile time
     template <typename T>
     struct message_header
     {
@@ -27,16 +30,20 @@ namespace Net
         uint32_t size = 0;
     };
 
+    // Message Body contains a header and a std::vector, containing raw bytes
+    // of infomation. This way the message can be variable length, but the size
+    // in the header must be updated.
     template <typename T>
     struct message
     {
+        // Header & Body vector
         message_header<T> header{};
         std::vector<uint8_t> body;
 
         // returns size of entire message packet in bytes
         size_t size() const
         {
-            return sizeof(message_header<T>) + body.size();
+            return body.size();
         }
 
         // Override for std::cout compatibility - produces friendly description of message
@@ -46,42 +53,62 @@ namespace Net
             return os;
         }
 
-        // pushes any POD-like data into the message buffer
+        // Convenience Operator overloads - These allow us to add and remove stuff from
+        // the body vector as if it were a stack, so First in, Last Out. These are a
+        // template in itself, because we dont know what data type the user is pushing or
+        // popping, so lets allow them all. NOTE: It assumes the data type is fundamentally
+        // Plain Old Data (POD). TLDR: Serialise & Deserialise into/from a vector
+
+        // Pushes any POD-like data into the message buffer
         template <typename DataType>
         friend message<T> &operator<<(message<T> &msg, const DataType &data)
         {
-            // check that the type of the data is trivially copyable
+            // Check that the type of the data being pushed is trivially copyable
             static_assert(std::is_standard_layout<DataType>::value, "Data is too complex to be pushed into vector");
-            // cache current size of the vector, as this will be the point we insert the data
+
+            // Cache current size of vector, as this will be the point we insert the data
             size_t i = msg.body.size();
-            // resize the vector by the size of the data being pushed
+
+            // Resize the vector by the size of the data being pushed
             msg.body.resize(msg.body.size() + sizeof(DataType));
-            // copy the data into the newly allocated vector space
+
+            // Physically copy the data into the newly allocated vector space
             std::memcpy(msg.body.data() + i, &data, sizeof(DataType));
 
-            msg.header.size = msg.body.size();
+            // Recalculate the message size
+            msg.header.size = msg.size();
 
+            // Return the target message so it can be "chained"
             return msg;
         }
 
-        // extracts any POD-like data from the message buffer
+        // Pulls any POD-like data form the message buffer
         template <typename DataType>
         friend message<T> &operator>>(message<T> &msg, DataType &data)
         {
-            // check that the type of the data is trivially copyable
-            static_assert(std::is_standard_layout<DataType>::value, "Data is too complex to be pushed into vector");
-            // cache current size of the vector, as this will be the point we insert the data
+            // Check that the type of the data being pushed is trivially copyable
+            static_assert(std::is_standard_layout<DataType>::value, "Data is too complex to be pulled from vector");
+
+            // Cache the location towards the end of the vector where the pulled data starts
             size_t i = msg.body.size() - sizeof(DataType);
-            // copy the data from the vector into the user variable
+
+            // Physically copy the data from the vector into the user variable
             std::memcpy(&data, msg.body.data() + i, sizeof(DataType));
-            // shrink the vector to remove read bytes, and reset end position
+
+            // Shrink the vector to remove read bytes, and reset end position
             msg.body.resize(i);
 
-            msg.header.size = msg.body.size();
+            // Recalculate the message size
+            msg.header.size = msg.size();
 
+            // Return the target message so it can be "chained"
             return msg;
         }
     };
+
+    // An "owned" message is identical to a regular message, but it is associated with
+    // a connection. On a server, the owner would be the client that sent the message,
+    // on a client the owner would be the server.
 
     // Forward declare the connection
     template <typename T>
@@ -101,359 +128,109 @@ namespace Net
         }
     };
 
+    // Queue
     template <typename T>
     class tsqueue
     {
     public:
-        tsqueue()
-        {
-            pthread_mutex_init(&muxQueue, nullptr);
-            pthread_mutex_init(&muxBlocking, nullptr);
-            pthread_cond_init(&cvBlocking, nullptr);
-        }
-
+        tsqueue() = default;
         tsqueue(const tsqueue<T> &) = delete;
-
-        virtual ~tsqueue()
-        {
-            clear();
-            pthread_mutex_destroy(&muxQueue);
-            pthread_mutex_destroy(&muxBlocking);
-            pthread_cond_destroy(&cvBlocking);
-        }
+        virtual ~tsqueue() { clear(); }
 
     public:
         // Returns and maintains item at front of Queue
         const T &front()
         {
-            pthread_mutex_lock(&muxQueue);
-            const T &item = deqQueue.front();
-            pthread_mutex_unlock(&muxQueue);
-            return item;
+            std::scoped_lock lock(muxQueue);
+            return deqQueue.front();
         }
 
         // Returns and maintains item at back of Queue
         const T &back()
         {
-            pthread_mutex_lock(&muxQueue);
-            const T &item = deqQueue.back();
-            pthread_mutex_unlock(&muxQueue);
-            return item;
+            std::scoped_lock lock(muxQueue);
+            return deqQueue.back();
         }
 
         // Removes and returns item from front of Queue
         T pop_front()
         {
-            pthread_mutex_lock(&muxQueue);
+            std::scoped_lock lock(muxQueue);
             auto t = std::move(deqQueue.front());
             deqQueue.pop_front();
-            pthread_mutex_unlock(&muxQueue);
             return t;
         }
 
         // Removes and returns item from back of Queue
         T pop_back()
         {
-            pthread_mutex_lock(&muxQueue);
+            std::scoped_lock lock(muxQueue);
             auto t = std::move(deqQueue.back());
             deqQueue.pop_back();
-            pthread_mutex_unlock(&muxQueue);
             return t;
         }
 
         // Adds an item to back of Queue
         void push_back(const T &item)
         {
-            pthread_mutex_lock(&muxQueue);
+            std::scoped_lock lock(muxQueue);
             deqQueue.emplace_back(std::move(item));
-            pthread_mutex_unlock(&muxQueue);
 
-            pthread_mutex_lock(&muxBlocking);
-            pthread_cond_signal(&cvBlocking);
-            pthread_mutex_unlock(&muxBlocking);
+            std::unique_lock<std::mutex> ul(muxBlocking);
+            cvBlocking.notify_one();
         }
 
         // Adds an item to front of Queue
         void push_front(const T &item)
         {
-            pthread_mutex_lock(&muxQueue);
+            std::scoped_lock lock(muxQueue);
             deqQueue.emplace_front(std::move(item));
-            pthread_mutex_unlock(&muxQueue);
 
-            pthread_mutex_lock(&muxBlocking);
-            pthread_cond_signal(&cvBlocking);
-            pthread_mutex_unlock(&muxBlocking);
+            std::unique_lock<std::mutex> ul(muxBlocking);
+            cvBlocking.notify_one();
         }
 
         // Returns true if Queue has no items
         bool empty()
         {
-            pthread_mutex_lock(&muxQueue);
-            bool isEmpty = deqQueue.empty();
-            pthread_mutex_unlock(&muxQueue);
-            return isEmpty;
+            std::scoped_lock lock(muxQueue);
+            return deqQueue.empty();
         }
 
         // Returns number of items in Queue
         size_t count()
         {
-            pthread_mutex_lock(&muxQueue);
-            size_t size = deqQueue.size();
-            pthread_mutex_unlock(&muxQueue);
-            return size;
+            std::scoped_lock lock(muxQueue);
+            return deqQueue.size();
         }
 
         // Clears Queue
         void clear()
         {
-            pthread_mutex_lock(&muxQueue);
+            std::scoped_lock lock(muxQueue);
             deqQueue.clear();
-            pthread_mutex_unlock(&muxQueue);
         }
 
         void wait()
         {
-            pthread_mutex_lock(&muxBlocking);
             while (empty())
             {
-                pthread_cond_wait(&cvBlocking, &muxBlocking);
+                std::unique_lock<std::mutex> ul(muxBlocking);
+                cvBlocking.wait(ul);
             }
-            pthread_mutex_unlock(&muxBlocking);
         }
 
     protected:
-        pthread_mutex_t muxQueue;
+        std::mutex muxQueue;
         std::deque<T> deqQueue;
-        pthread_cond_t cvBlocking;
-        pthread_mutex_t muxBlocking;
+        std::condition_variable cvBlocking;
+        std::mutex muxBlocking;
     };
 
+    // Connection
+    // Forward declare
     template <typename T>
-    class server_interface
-    {
-    public:
-        // Create a server, ready to listen on specified port
-        server_interface(uint16_t port)
-            : m_asioAcceptor(m_asioContext, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
-        {
-        }
-
-        virtual ~server_interface()
-        {
-            // May as well try and tidy up
-            Stop();
-        }
-
-        // Starts the server!
-        bool Start()
-        {
-            try
-            {
-                // Issue a task to the asio context - This is important
-                // as it will prime the context with "work", and stop it
-                // from exiting immediately. Since this is a server, we
-                // want it primed ready to handle clients trying to
-                // connect.
-                WaitForClientConnection();
-
-                // Launch the asio context in its own thread
-                m_threadContext = std::thread([this]()
-                                              { m_asioContext.run(); });
-            }
-            catch (std::exception &e)
-            {
-                // Something prohibited the server from listening
-                std::cerr << "[SERVER] Exception: " << e.what() << "\n";
-                return false;
-            }
-
-            std::cout << "[SERVER] Started!\n";
-            return true;
-        }
-
-        // Stops the server!
-        void Stop()
-        {
-            // Request the context to close
-            m_asioContext.stop();
-
-            // Tidy up the context thread
-            if (m_threadContext.joinable())
-                m_threadContext.join();
-
-            // Inform someone, anybody, if they care...
-            std::cout << "[SERVER] Stopped!\n";
-        }
-
-        // ASYNC - Instruct asio to wait for connection
-        void WaitForClientConnection()
-        {
-            // Prime context with an instruction to wait until a socket connects. This
-            // is the purpose of an "acceptor" object. It will provide a unique socket
-            // for each incoming connection attempt
-            m_asioAcceptor.async_accept(
-                [this](std::error_code ec, asio::ip::tcp::socket socket)
-                {
-                    // Triggered by incoming connection request
-                    if (!ec)
-                    {
-                        // Display some useful(?) information
-                        std::cout << "[SERVER] New Connection: " << socket.remote_endpoint() << "\n";
-
-                        // Create a new connection to handle this client
-                        std::shared_ptr<connection<T>> newconn =
-                            std::make_shared<connection<T>>(connection<T>::owner::server,
-                                                            m_asioContext, std::move(socket), m_qMessagesIn);
-
-                        // Give the user server a chance to deny connection
-                        if (OnClientConnect(newconn))
-                        {
-                            // Connection allowed, so add to container of new connections
-                            m_deqConnections.push_back(std::move(newconn));
-
-                            // And very important! Issue a task to the connection's
-                            // asio context to sit and wait for bytes to arrive!
-                            m_deqConnections.back()->ConnectToClient(nIDCounter++);
-
-                            std::cout << "[" << m_deqConnections.back()->GetID() << "] Connection Approved\n";
-                        }
-                        else
-                        {
-                            std::cout << "[-----] Connection Denied\n";
-
-                            // Connection will go out of scope with no pending tasks, so will
-                            // get destroyed automagically due to the wonder of smart pointers
-                        }
-                    }
-                    else
-                    {
-                        // Error has occurred during acceptance
-                        std::cout << "[SERVER] New Connection Error: " << ec.message() << "\n";
-                    }
-
-                    // Prime the asio context with more work - again simply wait for
-                    // another connection...
-                    WaitForClientConnection();
-                });
-        }
-
-        // Send a message to a specific client
-        void MessageClient(std::shared_ptr<connection<T>> client, const message<T> &msg)
-        {
-            // Check client is legitimate...
-            if (client && client->IsConnected())
-            {
-                // ...and post the message via the connection
-                client->Send(msg);
-            }
-            else
-            {
-                // If we cant communicate with client then we may as
-                // well remove the client - let the server know, it may
-                // be tracking it somehow
-                OnClientDisconnect(client);
-
-                // Off you go now, bye bye!
-                client.reset();
-
-                // Then physically remove it from the container
-                m_deqConnections.erase(
-                    std::remove(m_deqConnections.begin(), m_deqConnections.end(), client), m_deqConnections.end());
-            }
-        }
-
-        // Send message to all clients
-        void MessageAllClients(const message<T> &msg, std::shared_ptr<connection<T>> pIgnoreClient = nullptr)
-        {
-            bool bInvalidClientExists = false;
-
-            // Iterate through all clients in container
-            for (auto &client : m_deqConnections)
-            {
-                // Check client is connected...
-                if (client && client->IsConnected())
-                {
-                    // ..it is!
-                    if (client != pIgnoreClient)
-                        client->Send(msg);
-                }
-                else
-                {
-                    // The client couldnt be contacted, so assume it has
-                    // disconnected.
-                    OnClientDisconnect(client);
-                    client.reset();
-
-                    // Set this flag to then remove dead clients from container
-                    bInvalidClientExists = true;
-                }
-            }
-
-            // Remove dead clients, all in one go - this way, we dont invalidate the
-            // container as we iterated through it.
-            if (bInvalidClientExists)
-                m_deqConnections.erase(
-                    std::remove(m_deqConnections.begin(), m_deqConnections.end(), nullptr), m_deqConnections.end());
-        }
-
-        // Force server to respond to incoming messages
-        void Update(size_t nMaxMessages = -1, bool bWait = false)
-        {
-            if (bWait)
-                m_qMessagesIn.wait();
-
-            // Process as many messages as you can up to the value
-            // specified
-            size_t nMessageCount = 0;
-            while (nMessageCount < nMaxMessages && !m_qMessagesIn.empty())
-            {
-                // Grab the front message
-                auto msg = m_qMessagesIn.pop_front();
-
-                // Pass to message handler
-                OnMessage(msg.remote, msg.msg);
-
-                nMessageCount++;
-            }
-        }
-
-    protected:
-        // This server class should override thse functions to implement
-        // customised functionality
-
-        // Called when a client connects, you can veto the connection by returning false
-        virtual bool OnClientConnect(std::shared_ptr<connection<T>> client)
-        {
-            return false;
-        }
-
-        // Called when a client appears to have disconnected
-        virtual void OnClientDisconnect(std::shared_ptr<connection<T>> client)
-        {
-        }
-
-        // Called when a message arrives
-        virtual void OnMessage(std::shared_ptr<connection<T>> client, message<T> &msg)
-        {
-        }
-
-    protected:
-        // Thread Safe Queue for incoming message packets
-        tsqueue<owned_message<T>> m_qMessagesIn;
-
-        // Container of active validated connections
-        std::deque<std::shared_ptr<connection<T>>> m_deqConnections;
-
-        // Order of declaration is important - it is also the order of initialisation
-        asio::io_context m_asioContext;
-        std::thread m_threadContext;
-
-        // These things need an asio context
-        asio::ip::tcp::acceptor m_asioAcceptor; // Handles new incoming connection attempts...
-
-        // Clients will be identified in the "wider system" via an ID
-        uint32_t nIDCounter = 10000;
-    };
+    class server_interface;
 
     template <typename T>
     class connection : public std::enable_shared_from_this<connection<T>>
@@ -474,6 +251,23 @@ namespace Net
             : m_asioContext(asioContext), m_socket(std::move(socket)), m_qMessagesIn(qIn)
         {
             m_nOwnerType = parent;
+
+            // Construct validation check data
+            if (m_nOwnerType == owner::server)
+            {
+                // Connection is Server -> Client, construct random data for the client
+                // to transform and send back for validation
+                m_nHandshakeOut = uint32_t(std::chrono::system_clock::now().time_since_epoch().count());
+
+                // Pre-calculate the result for checking when the client responds
+                m_nHandshakeCheck = scramble(m_nHandshakeOut);
+            }
+            else
+            {
+                // Connection is Client -> Server, so we have nothing to define,
+                m_nHandshakeIn = 0;
+                m_nHandshakeOut = 0;
+            }
         }
 
         virtual ~connection()
@@ -488,14 +282,24 @@ namespace Net
         }
 
     public:
-        void ConnectToClient(uint32_t uid = 0)
+        void ConnectToClient(Net::server_interface<T> *server, uint32_t uid = 0)
         {
             if (m_nOwnerType == owner::server)
             {
                 if (m_socket.is_open())
                 {
                     id = uid;
-                    ReadHeader();
+
+                    // Was: ReadHeader();
+
+                    // A client has attempted to connect to the server, but we wish
+                    // the client to first validate itself, so first write out the
+                    // handshake data to be validated
+                    WriteValidation();
+
+                    // Next, issue a task to sit and wait asynchronously for precisely
+                    // the validation data sent back from the client
+                    ReadValidation(server);
                 }
             }
         }
@@ -511,7 +315,11 @@ namespace Net
                                     {
                                         if (!ec)
                                         {
-                                            ReadHeader();
+                                            // Was: ReadHeader();
+
+                                            // First thing server will do is send packet to be validated
+                                            // so wait for that and respond
+                                            ReadValidation();
                                         }
                                     });
             }
@@ -697,6 +505,80 @@ namespace Net
                              });
         }
 
+        // "Encrypt" data
+        uint32_t scramble(uint32_t nInput)
+        {
+            uint32_t out = nInput ^ 0xDEADBEEFC0DECAFE;
+            out = (out & 0xF0F0F0F0F0F0F0) >> 4 | (out & 0x0F0F0F0F0F0F0F) << 4;
+            return out ^ 0xC0DEFACE12345678;
+        }
+
+        // ASYNC - Used by both client and server to write validation packet
+        void WriteValidation()
+        {
+            asio::async_write(m_socket, asio::buffer(&m_nHandshakeOut, sizeof(uint32_t)),
+                              [this](std::error_code ec, std::size_t length)
+                              {
+                                  if (!ec)
+                                  {
+                                      // Validation data sent, clients should sit and wait
+                                      // for a response (or a closure)
+                                      if (m_nOwnerType == owner::client)
+                                          ReadHeader();
+                                  }
+                                  else
+                                  {
+                                      m_socket.close();
+                                  }
+                              });
+        }
+
+        void ReadValidation(Net::server_interface<T> *server = nullptr)
+        {
+            asio::async_read(m_socket, asio::buffer(&m_nHandshakeIn, sizeof(uint32_t)),
+                             [this, server](std::error_code ec, std::size_t length)
+                             {
+                                 if (!ec)
+                                 {
+                                     if (m_nOwnerType == owner::server)
+                                     {
+                                         // Connection is a server, so check response from client
+
+                                         // Compare sent data to actual solution
+                                         if (m_nHandshakeIn == m_nHandshakeCheck)
+                                         {
+                                             // Client has provided valid solution, so allow it to connect properly
+                                             std::cout << "Client Validated" << std::endl;
+                                             server->OnClientValidated(this->shared_from_this());
+
+                                             // Sit waiting to receive data now
+                                             ReadHeader();
+                                         }
+                                         else
+                                         {
+                                             // Client gave incorrect data, so disconnect
+                                             std::cout << "Client Disconnected (Fail Validation)" << std::endl;
+                                             m_socket.close();
+                                         }
+                                     }
+                                     else
+                                     {
+                                         // Connection is a client, so solve puzzle
+                                         m_nHandshakeOut = scramble(m_nHandshakeIn);
+
+                                         // Write the result
+                                         WriteValidation();
+                                     }
+                                 }
+                                 else
+                                 {
+                                     // Some biggerfailure occured
+                                     std::cout << "Client Disconnected (ReadValidation)" << std::endl;
+                                     m_socket.close();
+                                 }
+                             });
+        }
+
         // Once a full message is received, add it to the incoming queue
         void AddToIncomingMessageQueue()
         {
@@ -734,9 +616,18 @@ namespace Net
         // The "owner" decides how some of the connection behaves
         owner m_nOwnerType = owner::server;
 
+        // Handshake Validation
+        uint32_t m_nHandshakeOut = 0;
+        uint32_t m_nHandshakeIn = 0;
+        uint32_t m_nHandshakeCheck = 0;
+
+        bool m_bValidHandshake = false;
+        bool m_bConnectionEstablished = false;
+
         uint32_t id = 0;
     };
 
+    // Client
     template <typename T>
     class client_interface
     {
@@ -833,5 +724,239 @@ namespace Net
     private:
         // This is the thread safe queue of incoming messages from server
         tsqueue<owned_message<T>> m_qMessagesIn;
+    };
+
+    // Server
+    template <typename T>
+    class server_interface
+    {
+    public:
+        // Create a server, ready to listen on specified port
+        server_interface(uint16_t port)
+            : m_asioAcceptor(m_asioContext, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
+        {
+        }
+
+        virtual ~server_interface()
+        {
+            // May as well try and tidy up
+            Stop();
+        }
+
+        // Starts the server!
+        bool Start()
+        {
+            try
+            {
+                // Issue a task to the asio context - This is important
+                // as it will prime the context with "work", and stop it
+                // from exiting immediately. Since this is a server, we
+                // want it primed ready to handle clients trying to
+                // connect.
+                WaitForClientConnection();
+
+                // Launch the asio context in its own thread
+                m_threadContext = std::thread([this]()
+                                              { m_asioContext.run(); });
+            }
+            catch (std::exception &e)
+            {
+                // Something prohibited the server from listening
+                std::cerr << "[SERVER] Exception: " << e.what() << "\n";
+                return false;
+            }
+
+            std::cout << "[SERVER] Started!\n";
+            return true;
+        }
+
+        // Stops the server!
+        void Stop()
+        {
+            // Request the context to close
+            m_asioContext.stop();
+
+            // Tidy up the context thread
+            if (m_threadContext.joinable())
+                m_threadContext.join();
+
+            // Inform someone, anybody, if they care...
+            std::cout << "[SERVER] Stopped!\n";
+        }
+
+        // ASYNC - Instruct asio to wait for connection
+        void WaitForClientConnection()
+        {
+            // Prime context with an instruction to wait until a socket connects. This
+            // is the purpose of an "acceptor" object. It will provide a unique socket
+            // for each incoming connection attempt
+            m_asioAcceptor.async_accept(
+                [this](std::error_code ec, asio::ip::tcp::socket socket)
+                {
+                    // Triggered by incoming connection request
+                    if (!ec)
+                    {
+                        // Display some useful(?) information
+                        std::cout << "[SERVER] New Connection: " << socket.remote_endpoint() << "\n";
+
+                        // Create a new connection to handle this client
+                        std::shared_ptr<connection<T>> newconn =
+                            std::make_shared<connection<T>>(connection<T>::owner::server,
+                                                            m_asioContext, std::move(socket), m_qMessagesIn);
+
+                        // Give the user server a chance to deny connection
+                        if (OnClientConnect(newconn))
+                        {
+                            // Connection allowed, so add to container of new connections
+                            m_deqConnections.push_back(std::move(newconn));
+
+                            // And very important! Issue a task to the connection's
+                            // asio context to sit and wait for bytes to arrive!
+                            m_deqConnections.back()->ConnectToClient(this, nIDCounter++);
+
+                            std::cout << "[" << m_deqConnections.back()->GetID() << "] Connection Approved\n";
+                        }
+                        else
+                        {
+                            std::cout << "[-----] Connection Denied\n";
+
+                            // Connection will go out of scope with no pending tasks, so will
+                            // get destroyed automagically due to the wonder of smart pointers
+                        }
+                    }
+                    else
+                    {
+                        // Error has occurred during acceptance
+                        std::cout << "[SERVER] New Connection Error: " << ec.message() << "\n";
+                    }
+
+                    // Prime the asio context with more work - again simply wait for
+                    // another connection...
+                    WaitForClientConnection();
+                });
+        }
+
+        // Send a message to a specific client
+        void MessageClient(std::shared_ptr<connection<T>> client, const message<T> &msg)
+        {
+            // Check client is legitimate...
+            if (client && client->IsConnected())
+            {
+                // ...and post the message via the connection
+                client->Send(msg);
+            }
+            else
+            {
+                // If we cant communicate with client then we may as
+                // well remove the client - let the server know, it may
+                // be tracking it somehow
+                OnClientDisconnect(client);
+
+                // Off you go now, bye bye!
+                client.reset();
+
+                // Then physically remove it from the container
+                m_deqConnections.erase(
+                    std::remove(m_deqConnections.begin(), m_deqConnections.end(), client), m_deqConnections.end());
+            }
+        }
+
+        // Send message to all clients
+        void MessageAllClients(const message<T> &msg, std::shared_ptr<connection<T>> pIgnoreClient = nullptr)
+        {
+            bool bInvalidClientExists = false;
+
+            // Iterate through all clients in container
+            for (auto &client : m_deqConnections)
+            {
+                // Check client is connected...
+                if (client && client->IsConnected())
+                {
+                    // ..it is!
+                    if (client != pIgnoreClient)
+                        client->Send(msg);
+                }
+                else
+                {
+                    // The client couldnt be contacted, so assume it has
+                    // disconnected.
+                    OnClientDisconnect(client);
+                    client.reset();
+
+                    // Set this flag to then remove dead clients from container
+                    bInvalidClientExists = true;
+                }
+            }
+
+            // Remove dead clients, all in one go - this way, we dont invalidate the
+            // container as we iterated through it.
+            if (bInvalidClientExists)
+                m_deqConnections.erase(
+                    std::remove(m_deqConnections.begin(), m_deqConnections.end(), nullptr), m_deqConnections.end());
+        }
+
+        // Force server to respond to incoming messages
+        void Update(size_t nMaxMessages = -1, bool bWait = false)
+        {
+            if (bWait)
+                m_qMessagesIn.wait();
+
+            // Process as many messages as you can up to the value
+            // specified
+            size_t nMessageCount = 0;
+            while (nMessageCount < nMaxMessages && !m_qMessagesIn.empty())
+            {
+                // Grab the front message
+                auto msg = m_qMessagesIn.pop_front();
+
+                // Pass to message handler
+                OnMessage(msg.remote, msg.msg);
+
+                nMessageCount++;
+            }
+        }
+
+    protected:
+        // This server class should override thse functions to implement
+        // customised functionality
+
+        // Called when a client connects, you can veto the connection by returning false
+        virtual bool OnClientConnect(std::shared_ptr<connection<T>> client)
+        {
+            return false;
+        }
+
+        // Called when a client appears to have disconnected
+        virtual void OnClientDisconnect(std::shared_ptr<connection<T>> client)
+        {
+        }
+
+        // Called when a message arrives
+        virtual void OnMessage(std::shared_ptr<connection<T>> client, message<T> &msg)
+        {
+        }
+
+    public:
+        // Called when a client is validated
+        virtual void OnClientValidated(std::shared_ptr<connection<T>> client)
+        {
+        }
+
+    protected:
+        // Thread Safe Queue for incoming message packets
+        tsqueue<owned_message<T>> m_qMessagesIn;
+
+        // Container of active validated connections
+        std::deque<std::shared_ptr<connection<T>>> m_deqConnections;
+
+        // Order of declaration is important - it is also the order of initialisation
+        asio::io_context m_asioContext;
+        std::thread m_threadContext;
+
+        // These things need an asio context
+        asio::ip::tcp::acceptor m_asioAcceptor; // Handles new incoming connection attempts...
+
+        // Clients will be identified in the "wider system" via an ID
+        uint32_t nIDCounter = 10000;
     };
 }
